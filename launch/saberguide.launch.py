@@ -83,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
     container_name = LaunchConfiguration('container_name')
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    svo_filename = f"/home/user/01_svo/saberguid_zed_{timestamp}.svo2"
+    svo_filename = f"/home/user/01_svo/arche2026_zed_{timestamp}.svo2"
 
     container_name_val = container_name.perform(context)
     if container_name_val == '':
