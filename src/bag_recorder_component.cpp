@@ -58,9 +58,9 @@ auto set_ts_impl(M &m, int64_t send_ns, int64_t recv_ns, int)
 
 // Fallback to old API (time_stamp) if it exists
 template<typename M>
-auto set_ts_impl(M &m, int64_t send_ns, int64_t /*recv_ns*/, long)
-  -> decltype((m.time_stamp = send_ns), void()) {
-  m.time_stamp = send_ns;
+auto set_ts_impl(M &m, int64_t /*send_ns*/, int64_t recv_ns /*recv_ns*/, long)
+  -> decltype((m.time_stamp = recv_ns), void()) {
+  m.time_stamp = recv_ns;
   return;
 }
 
