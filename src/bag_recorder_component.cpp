@@ -683,6 +683,11 @@ namespace lsy_ros_data_utils::rosbag {
 
   void BagRecorderComponent::build_and_enqueue_msg(const std::string &topic_name, int64_t send_ns, int64_t recv_ns,
                                                    std::shared_ptr<rcutils_uint8_array_t> payload) {
+    // sane lower bound, e.g. 2020-01-01 UTC; anything below is an unset/garbage stamp
+    static constexpr int64_t kMinSaneNs = 1577836800000000000LL;
+    if (send_ns < kMinSaneNs) {
+      send_ns = recv_ns;   // fall back to receive time instead of writing 1970
+    }
     auto bag_msg = std::make_shared<rosbag2_storage::SerializedBagMessage>();
     bag_msg->topic_name = topic_name;
     this->set_bag_message_timestamps(*bag_msg, send_ns, recv_ns);
