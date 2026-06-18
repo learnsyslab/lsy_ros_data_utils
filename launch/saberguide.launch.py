@@ -61,7 +61,7 @@ def call_zed_record_svo_service(svo_path):
     service_name = "/zed/zed_node/start_svo_rec"
     service_type = "zed_msgs/srv/StartSvoRec"
     # Format the request as a YAML-style string
-    service_request = f"'{{svo_filename: \"{svo_path}\", compression_mode: 4}}'"
+    service_request = f"'{{svo_filename: \"{svo_path}\", compression_mode: 2}}'"
 
     return ExecuteProcess(
         cmd=[
