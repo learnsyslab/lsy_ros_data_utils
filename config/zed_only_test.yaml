@@ -14,10 +14,10 @@ bags:
     storage_id: "mcap"
     storage_config_file: "mcap_config.yaml"
     uri_with_datetime: true
-    max_queue_bytes: 4294967296     # 1GiB MiB
-    max_queue_size: 5000          # secondary cap
-    bag_cache_size: 4             # GB
-    overflow_policy: block  # or "block" drop_oldest
+    max_queue_bytes: 8589934592     # ~8.0 GiB RAM buffer (the only buffer, see bag_cache_size)
+    max_queue_size: 1000000       # count cap; effectively off, the byte cap is what matters
+    bag_cache_size: 0             # GiB; 0 = no rosbag2 cache (it drops silently when full)
+    overflow_policy: drop_oldest  # never stalls the executor; every drop is counted in the monitor
     warn_on_overflow: true
     overflow_warn_period_sec: 1.0
     compress_image: false

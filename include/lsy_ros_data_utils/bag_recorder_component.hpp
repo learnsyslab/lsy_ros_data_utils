@@ -34,28 +34,26 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <type_traits>
 
 // ros utils
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_components/component_manager.hpp>
+#include <rclcpp/serialization.hpp>
 #include <rosbag2_cpp/writer.hpp>
 #include <rosbag2_storage/serialized_bag_message.hpp>
-#include <rclcpp/serialization.hpp>
 #include <rosbag2_storage/topic_metadata.hpp>
 
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
-
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
 
 #include "utils.hpp"
 #include "msg_converter.hpp"
@@ -64,8 +62,9 @@ namespace lsy_ros_data_utils::rosbag {
   struct TopicSpec {
     std::string name;
     std::string type;
-    std::string qos; // "sensor_data" or "default"
-    std::string mode; // "auto" or "typed" for intra communication process or "generic" with serialization
+    std::string qos{"default"}; // normalized: "sensor_data" or "default"
+    size_t qos_depth{0}; // 0 => use the profile's default depth
+    std::string mode{"auto"}; // "auto" | "typed" (intra-process capable) | "generic" (serialized)
     rclcpp::CallbackGroup::SharedPtr cb_group;
     bool monitor_enabled{false};
     double expected_hz{0.0};
@@ -80,23 +79,26 @@ namespace lsy_ros_data_utils::rosbag {
 
     std::string name;
     std::string bag_uri;
-    bool uri_with_datetime{false};
-    bool enable_message_monitoring{false};
+    bool uri_with_datetime{true};
     std::string storage_id{"mcap"};
-    std::string storage_config_uri{""}; // <--- Add this field
+    std::string storage_config_uri;
 
-    // queue limits
-    size_t max_queue_size{20000}; // secondary cap by count
-    size_t max_queue_bytes{1024ull * 1024 * 1024}; // 1 GiB per bag default
-    size_t bag_cache_size{2ull * 1024 * 1024 * 1024}; // 2 GiB per bag default
-    size_t max_bag_size{50ull * 1024 * 1024 * 1024}; // 50 GiB per bag default
+    // queue limits (queued + currently being written)
+    size_t max_queue_size{20000}; // cap by message count
+    size_t max_queue_bytes{1ull << 30}; // cap by bytes, 1 GiB default
+    size_t bag_cache_size{0}; // rosbag2 internal cache; 0 (default) = write-through, our queue is the only buffer
+    size_t max_bag_size{50ull << 30}; // split size, 50 GiB default (0 = no splitting)
 
-    // overflow policy: "drop_oldest" (default) or "block"
-    OverflowPolicy overflow_policy = OverflowPolicy::DROP_OLDEST;
-    std::vector<TopicSpec> topics;
-
+    OverflowPolicy overflow_policy{OverflowPolicy::DROP_OLDEST};
     bool warn_on_overflow{true};
     double overflow_warn_period_sec{1.0}; // rate-limit warnings
+
+    // image compression: applies to sensor_msgs/msg/Image topics of this bag,
+    // which are then recorded as sensor_msgs/msg/CompressedImage on "<topic>/compressed"
+    bool compress_images{false};
+    ImageCompressionCfg compression;
+
+    std::vector<TopicSpec> topics;
   };
 
   class BagRecorderComponent final : public rclcpp::Node {
@@ -106,17 +108,8 @@ namespace lsy_ros_data_utils::rosbag {
     ~BagRecorderComponent() override;
 
   private:
-    // ---------- config ----------
-    void load_config(const std::string &yaml_path);
-
-    // ---------- subscriptions ----------
-    void create_subscriptions();
-
-    void build_and_enqueue_msg(
-      const std::string &topic_name,
-      int64_t send_ns,
-      int64_t recv_ns,
-      std::shared_ptr<rcutils_uint8_array_t> payload);
+    using BagMsgPtr = std::shared_ptr<rosbag2_storage::SerializedBagMessage>;
+    using PayloadPtr = std::shared_ptr<rcutils_uint8_array_t>;
 
     struct MonitorCfg {
       bool enabled{false};
@@ -124,15 +117,14 @@ namespace lsy_ros_data_utils::rosbag {
       double ewma_tau_sec{2.0};
       double warn_grace_sec{2.0};
       bool use_ansi_color{true};
+      bool clear_screen{true};
     };
 
     struct TopicStats {
-      bool enabled{false};
       double expected_hz{0.0};
       double warn_below_hz{0.0};
 
       std::atomic<uint64_t> count{0};
-      std::atomic<int64_t> first_rx_ns{0}; // steady clock ns
       std::atomic<int64_t> last_rx_ns{0}; // steady clock ns
       std::atomic<double> ewma_hz{0.0};
       std::atomic<int64_t> below_since_ns{0}; // steady clock ns, 0 => not below
@@ -143,170 +135,202 @@ namespace lsy_ros_data_utils::rosbag {
       BagSpec spec;
       rosbag2_cpp::Writer writer;
 
+      // ---- guarded by mtx ----
       std::mutex mtx;
-      std::condition_variable cv;
+      std::condition_variable cv_not_empty; // writer waits on this
+      std::condition_variable cv_not_full; // BLOCK-mode producers wait on this
+      std::deque<BagMsgPtr> queue;
+      size_t pending_msgs{0}; // queued + currently being written
+      size_t pending_bytes{0}; // queued + currently being written
+      size_t blocked_producers{0};
+      bool stop{false};
 
-      //std::deque<std::shared_ptr<const BagItem> > msg_queue;
-      std::deque<std::shared_ptr<rosbag2_storage::SerializedBagMessage> > msg_queue;
-      size_t queued_bytes{0};
-
-      std::atomic<bool> stop{false};
       std::thread thread;
 
+      // ---- monotonic statistics ----
+      std::atomic<uint64_t> enqueued_msgs{0};
+      std::atomic<uint64_t> written_msgs{0};
       std::atomic<uint64_t> dropped_msgs{0};
-      std::atomic<uint64_t> dropped_bytes{0};
-      std::atomic<uint64_t> overflow_events{0};
+      std::atomic<uint64_t> write_errors{0};
+
+      // ---- rate-limited warning state ----
+      std::atomic<uint64_t> dropped_since_warn{0};
+      std::atomic<uint64_t> dropped_bytes_since_warn{0};
       std::atomic<int64_t> last_overflow_warn_ns{0}; // steady clock ns
-      std::atomic<uint64_t> total_enqueued_msgs{0};
-      std::atomic<uint64_t> total_written_msgs{0};
+      std::atomic<int64_t> last_error_warn_ns{0}; // steady clock ns
     };
+
+    // One per unique subscribed topic. Resolved once at startup, so the hot path
+    // does no map lookups. Stored behind unique_ptr => stable addresses.
+    struct TopicRoute {
+      std::string topic;
+      std::string type;
+      std::string compressed_topic; // topic name used in bags that compress this image topic
+      std::string qos{"default"};
+      size_t qos_depth{0};
+      std::string mode{"auto"};
+      rclcpp::CallbackGroup::SharedPtr cb_group;
+
+      TopicStats *stats{nullptr}; // nullptr => not monitored
+      std::vector<BagRuntime *> raw_bags; // bags recording the message as-is
+      std::vector<BagRuntime *> compressed_bags; // bags recording a compressed image
+      ImageCompressionCfg compression;
+
+      std::atomic<int64_t> last_error_warn_ns{0};
+    };
+
+    // Shared with every callback (captured by value), so a callback that races with
+    // destruction can still safely check whether the node is going away.
+    struct Lifetime {
+      std::atomic<bool> shutting_down{false};
+      std::atomic<int> active_callbacks{0};
+    };
+
+    class CallbackScope {
+    public:
+      explicit CallbackScope(Lifetime &life) : life_(life) {
+        // increment first, then check: pairs with request_stop() (set flag, then wait for 0)
+        life_.active_callbacks.fetch_add(1);
+        ok_ = !life_.shutting_down.load();
+      }
+
+      ~CallbackScope() { life_.active_callbacks.fetch_sub(1); }
+
+      CallbackScope(const CallbackScope &) = delete;
+
+      CallbackScope &operator=(const CallbackScope &) = delete;
+
+      [[nodiscard]] bool ok() const { return ok_; }
+
+    private:
+      Lifetime &life_;
+      bool ok_{false};
+    };
+
+    // ---------- setup ----------
+    void load_config(const std::string &yaml_path);
+
+    void build_routes();
 
     void open_bag_and_create_topics(BagRuntime &br) const;
 
-    void writer_loop(BagRuntime *br) const;
+    void create_subscriptions();
 
-    // message handling
-    static std::shared_ptr<rcutils_uint8_array_t> make_rcutils_uint8_array_copy(
-      const rclcpp::SerializedMessage &serialized);
-
-    static std::shared_ptr<rcutils_uint8_array_t> make_rcutils_uint8_array_copy(
-      const rcl_serialized_message_t &rcl);
-
-    void set_bag_message_timestamps(
-      rosbag2_storage::SerializedBagMessage &m,
-      int64_t send_ns,
-      int64_t recv_ns) const;
+    rclcpp::SubscriptionBase::SharedPtr create_generic_route_subscription(
+      TopicRoute &route, const rclcpp::QoS &qos, const rclcpp::SubscriptionOptions &options);
 
     void init_type_registry();
 
     template<typename MsgT>
-    void register_type(const std::string &type_name); // implemented below (header)
+    void register_type(const std::string &type_name);
 
-    void fanout_enqueue_item(std::shared_ptr<rosbag2_storage::SerializedBagMessage> msg);
+    // ---------- hot path ----------
+    template<typename MsgT>
+    void handle_typed(TopicRoute &route, const MsgT &msg);
 
-    // topic statics
-    void on_rx(const std::string &topic, int64_t recv_ns_steady);
+    void dispatch(const std::vector<BagRuntime *> &bags,
+                  const std::string &bag_topic,
+                  int64_t send_ns,
+                  int64_t recv_ns,
+                  PayloadPtr payload);
+
+    void enqueue(BagRuntime &br, const BagMsgPtr &msg);
+
+    void report_callback_error(TopicRoute &route, const std::string &what);
+
+    static PayloadPtr to_payload(rclcpp::SerializedMessage &&serialized);
+
+    static void set_bag_message_timestamps(
+      rosbag2_storage::SerializedBagMessage &m, int64_t send_ns, int64_t recv_ns);
+
+    // ---------- writer ----------
+    void writer_loop(BagRuntime &br) const;
+
+    void request_stop();
+
+    // ---------- monitoring ----------
+    void on_rx(TopicStats *st, int64_t recv_ns_steady) const;
 
     void monitor_timer_cb();
 
-  private: // variables
-    // general parameters
+    // ---------- variables ----------
     std::string cfg_file_;
-    bool compress_images_{false};
-    int jpeg_quality_{95};
-    int png_level_{3};
-    std::string compression_type_{"png"};
+    std::shared_ptr<Lifetime> life_ = std::make_shared<Lifetime>();
+    rclcpp::Context::SharedPtr context_;
+    std::optional<rclcpp::OnShutdownCallbackHandle> shutdown_cb_handle_;
 
-    std::atomic<bool> is_shutting_down_{false};
-    std::atomic<int> active_callbacks_{0};
-    // loaded bags
     std::vector<std::unique_ptr<BagRuntime> > bags_;
-
-    // routing: topic -> which bags want it
-    std::unordered_map<std::string, std::vector<size_t> > topic_to_bags_;
-    // For creating exactly one subscription per topic
-    std::unordered_map<std::string, std::string> topic_to_type_;
-    std::unordered_map<std::string, std::string> topic_to_qos_; // merged qos policy
-    std::unordered_map<std::string, std::string> topic_to_mode_; // per unique topic
-    std::unordered_map<std::string, rclcpp::CallbackGroup::SharedPtr> topic_to_callback_groups_;
-
+    std::map<std::string, std::unique_ptr<TopicRoute> > routes_;
     std::vector<rclcpp::CallbackGroup::SharedPtr> cb_groups_;
-    size_t next_cb_group_idx_{0};
 
-    // registry: "sensor_msgs/msg/Image" -> factory that creates typed sub
+    // registry: "sensor_msgs/msg/Image" -> factory that creates a typed (intra-process capable) sub
     using SubFactory = std::function<rclcpp::SubscriptionBase::SharedPtr(
-      const std::string &topic_name,
-      const rclcpp::QoS &qos)>;
-
+      TopicRoute &route,
+      const rclcpp::QoS &qos,
+      const rclcpp::SubscriptionOptions &options)>;
     std::unordered_map<std::string, SubFactory> type_registry_;
 
-    // Keep subscriptions alive
     std::vector<rclcpp::SubscriptionBase::SharedPtr> subs_;
 
-    // monitoring runtime
+    // monitoring (std::map => sorted output, stable element addresses)
     MonitorCfg monitor_cfg_;
     rclcpp::TimerBase::SharedPtr monitor_timer_;
-    std::unordered_map<std::string, TopicStats> topic_stats_;
+    std::map<std::string, TopicStats> topic_stats_;
   };
 
   // ============ template implementation (must be in header) ============
 
   template<typename MsgT>
   void BagRecorderComponent::register_type(const std::string &type_name) {
-    // Store a factory that will create a typed subscription for MsgT.
-    // This keeps intra-process compatibility because it is a typed rclcpp subscription.
-    auto compress_images = false;
-    if (type_name == "sensor_msgs/msg/Image" && compress_images_) {
-      compress_images = true;
+    type_registry_[type_name] =
+        [this](TopicRoute &route,
+               const rclcpp::QoS &qos,
+               const rclcpp::SubscriptionOptions &options) -> rclcpp::SubscriptionBase::SharedPtr {
+          TopicRoute *r = &route;
+          auto life = life_;
+          // ConstSharedPtr callback: with intra-process comms the message is delivered without a copy.
+          auto cb = [this, r, life](typename MsgT::ConstSharedPtr msg) {
+            const CallbackScope scope(*life);
+            if (!scope.ok()) return;
+            try {
+              this->handle_typed<MsgT>(*r, *msg);
+            } catch (const std::exception &e) {
+              this->report_callback_error(*r, e.what());
+            }
+          };
+          return this->create_subscription<MsgT>(route.topic, qos, std::move(cb), options);
+        };
+  }
+
+  template<typename MsgT>
+  void BagRecorderComponent::handle_typed(TopicRoute &route, const MsgT &msg) {
+    on_rx(route.stats, now_ns_steady());
+
+    const int64_t recv_ns = this->now().nanoseconds();
+    const int64_t send_ns = get_message_timestamp_ns(msg, recv_ns);
+
+    if (!route.raw_bags.empty()) {
+      static const rclcpp::Serialization<MsgT> ser;
+      rclcpp::SerializedMessage serialized;
+      ser.serialize_message(&msg, &serialized);
+      dispatch(route.raw_bags, route.topic, send_ns, recv_ns, to_payload(std::move(serialized)));
     }
 
-    type_registry_[type_name] =
-        [this, compress_images](const std::string &topic_name,
-                                const rclcpp::QoS &qos) -> rclcpp::SubscriptionBase::SharedPtr {
-          // serializer for MsgT (type-erased via void*)
-
-          // callback receives a shared_ptr to the in-memory message (intra-process friendly)
-          auto cb = [this, topic_name, compress_images](typename MsgT::ConstSharedPtr msg) {
-
-            if (this->is_shutting_down_.load(std::memory_order_relaxed)) {
-              return;
-            }
-
-            // 2. Track this active callback
-            //this->active_callbacks_.fetch_add(1, std::memory_order_acquire);
-           // struct CallbackTracker {
-           //   std::atomic<int>& count;
-            //  CallbackTracker(std::atomic<int>& c) : count(c) {}
-            //  ~CallbackTracker() {
-            //    count.fetch_sub(1, std::memory_order_release);
-             // }
-            //} tracker(this->active_callbacks_);
-
-            
-            // monitoring: steady clock, lock-free
-            const int64_t recv_ns_steady = now_ns_steady();
-            this->on_rx(topic_name, recv_ns_steady);
-
-            const int64_t recv_ns = this->now().nanoseconds();
-            const int64_t send_ns = get_message_timestamp_ns(*msg, recv_ns);
-
-            std::string topic_name_bag = topic_name;
-
-            // erase type without copying payload
-            rclcpp::SerializedMessage serialized_msg;
-
-            if constexpr (std::is_same_v<MsgT, sensor_msgs::msg::Image>) {
-              if (compress_images) {
-                topic_name_bag += "/compressed";
-                const rclcpp::Serialization<sensor_msgs::msg::CompressedImage> ser;
-                const auto compressed_img = toCompressed(msg, compression_type_, jpeg_quality_, png_level_);
-                ser.serialize_message(&compressed_img, &serialized_msg);
-              } else {
-                // dirty fix
-                rclcpp::Serialization<MsgT> ser;
-                ser.serialize_message(msg.get(), &serialized_msg);
-              }
-            } else {
-              rclcpp::Serialization<MsgT> ser;
-              ser.serialize_message(msg.get(), &serialized_msg);
-            }
-
-            auto payload = std::shared_ptr<rcutils_uint8_array_t>(
-              new rcutils_uint8_array_t(serialized_msg.release_rcl_serialized_message()),
-              [](rcutils_uint8_array_t *arr) {
-                if (arr) {
-                  rcutils_uint8_array_fini(arr);
-                  delete arr;
-                }
-              });
-
-            // enqueue raw message pointer + serializer; writer thread will serialize
-            this->build_and_enqueue_msg(topic_name_bag, send_ns, recv_ns, std::move(payload));
-          };
-          auto subscription_options = rclcpp::SubscriptionOptions();
-          subscription_options.callback_group = topic_to_callback_groups_.at(topic_name);
-          return this->create_subscription<MsgT>(topic_name, qos, std::move(cb), subscription_options);
-        };
+    if constexpr (std::is_same_v<MsgT, sensor_msgs::msg::Image>) {
+      if (!route.compressed_bags.empty()) {
+        std::string err;
+        const auto compressed = to_compressed(msg, route.compression, &err);
+        if (!compressed) {
+          report_callback_error(route, "image compression failed: " + err);
+          return;
+        }
+        static const rclcpp::Serialization<sensor_msgs::msg::CompressedImage> ser;
+        rclcpp::SerializedMessage serialized;
+        ser.serialize_message(&*compressed, &serialized);
+        dispatch(route.compressed_bags, route.compressed_topic, send_ns, recv_ns,
+                 to_payload(std::move(serialized)));
+      }
+    }
   }
 }
 

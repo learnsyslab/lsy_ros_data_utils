@@ -14,6 +14,7 @@ endif ()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(yaml-cpp REQUIRED)
@@ -63,6 +64,7 @@ include_directories(
 set(AMENT_DEPENDENCIES_GENERAL
         rclcpp
         rclcpp_components
+        ament_index_cpp
         rosbag2_cpp
         rosbag2_storage
 )
@@ -71,7 +73,6 @@ set(AMENT_DEPENDENCIES_GENERAL
 add_library(bag_recorder_component SHARED
         src/bag_recorder_component.cpp
         src/bag_recorder_type_registration.cpp
-        include/lsy_ros_data_utils/msg_converter.hpp
 )
 target_link_libraries(bag_recorder_component
         yaml-cpp

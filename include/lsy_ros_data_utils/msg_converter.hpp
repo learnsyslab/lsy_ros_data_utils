@@ -32,112 +32,112 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 
+#include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <stdexcept>
+#include <algorithm>
+#include <cctype>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace lsy_ros_data_utils {
-  // Map ROS encoding to OpenCV type + channel count.
-  // (We keep this minimal for speed; extend if you need more encodings.)
-  inline void encoding_to_cv_type(const std::string &enc, int &cv_type, int &channels) {
-    if (enc == "rgba8" || enc == "bgra8") {
-      cv_type = CV_8UC4;
-      channels = 4;
-      return;
-    }
-    if (enc == "rgb8" || enc == "bgr8") {
-      cv_type = CV_8UC3;
-      channels = 3;
-      return;
-    }
-    if (enc == "mono8") {
-      cv_type = CV_8UC1;
-      channels = 1;
-      return;
-    }
-    throw std::runtime_error("Unsupported encoding: " + enc);
+  struct ImageCompressionCfg {
+    std::string format{"png"}; // "png" or "jpeg" (normalized)
+    int jpeg_quality{95}; // [0..100]
+    int png_level{3}; // [0..9], higher = smaller, slower
+
+    bool operator==(const ImageCompressionCfg &) const = default;
+  };
+
+  // Returns "png" / "jpeg", or an empty string if unsupported.
+  inline std::string normalize_compression_format(std::string fmt) {
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (fmt == "jpg") fmt = "jpeg";
+    if (fmt == "png" || fmt == "jpeg") return fmt;
+    return {};
   }
 
-  // Efficient conversion: raw Image -> CompressedImage.
-  // - format: "png" or "jpeg" (or "jpg")
-  // - jpeg_quality: [0..100]
-  // - png_level: [0..9]  (higher = smaller, slower)
+  struct EncodingInfo {
+    int cv_type{0};
+    int bit_depth{8};
+    bool color{false};
+    int to_bgr{-1}; // cv::ColorConversionCodes, -1 => already BGR / mono
+  };
 
-  inline sensor_msgs::msg::CompressedImage toCompressed(
-    sensor_msgs::msg::Image::ConstSharedPtr in,
-    const std::string &format = "png",
-    int jpeg_quality = 95,
-    int png_level = 3) {
-    // 1) Wrap input buffer without copying.
-    int cv_type = 0, channels = 0;
-    encoding_to_cv_type(in->encoding, cv_type, channels);
+  inline std::optional<EncodingInfo> encoding_info(const std::string &enc) {
+    if (enc == "bgr8") return EncodingInfo{CV_8UC3, 8, true, -1};
+    if (enc == "rgb8") return EncodingInfo{CV_8UC3, 8, true, cv::COLOR_RGB2BGR};
+    if (enc == "bgra8") return EncodingInfo{CV_8UC4, 8, true, cv::COLOR_BGRA2BGR};
+    if (enc == "rgba8") return EncodingInfo{CV_8UC4, 8, true, cv::COLOR_RGBA2BGR};
+    if (enc == "mono8" || enc == "8UC1") return EncodingInfo{CV_8UC1, 8, false, -1};
+    if (enc == "mono16" || enc == "16UC1") return EncodingInfo{CV_16UC1, 16, false, -1};
+    return std::nullopt;
+  }
 
-    if (in->step == 0 || in->data.empty()) {
-      std::cout << "Input image has empty data/step." << std::endl;
+  // Raw Image -> CompressedImage, following the compressed_image_transport conventions
+  // (color images are stored as BGR, format string "<enc>; <png|jpeg> compressed <target>"),
+  // so the result can be decoded by image_transport / Foxglove.
+  // Returns std::nullopt (and fills *error) instead of throwing.
+  inline std::optional<sensor_msgs::msg::CompressedImage> to_compressed(
+    const sensor_msgs::msg::Image &in,
+    const ImageCompressionCfg &cfg,
+    std::string *error = nullptr) {
+    auto fail = [&](const std::string &msg) -> std::optional<sensor_msgs::msg::CompressedImage> {
+      if (error) *error = msg;
+      return std::nullopt;
+    };
+
+    const std::string fmt = normalize_compression_format(cfg.format);
+    if (fmt.empty()) return fail("unsupported compression format '" + cfg.format + "'");
+
+    const auto info = encoding_info(in.encoding);
+    if (!info) return fail("unsupported image encoding '" + in.encoding + "'");
+    if (fmt == "jpeg" && info->bit_depth != 8) {
+      return fail("JPEG cannot store " + std::to_string(info->bit_depth) + "-bit image '" + in.encoding + "'");
     }
 
-    // rows = height, cols = width; step is bytes per row.
-    const cv::Mat src(static_cast<int>(in->height),
-                      static_cast<int>(in->width),
-                      cv_type,
-                      const_cast<uint8_t *>(in->data.data()), // OpenCV API is non-const, but we won't modify.
-                      static_cast<size_t>(in->step));
+    const size_t min_step = static_cast<size_t>(in.width) * CV_ELEM_SIZE(info->cv_type);
+    if (in.width == 0 || in.height == 0 || in.step < min_step ||
+        in.data.size() < static_cast<size_t>(in.step) * in.height) {
+      return fail("inconsistent image size (w=" + std::to_string(in.width) + " h=" + std::to_string(in.height) +
+                  " step=" + std::to_string(in.step) + " data=" + std::to_string(in.data.size()) + ")");
+    }
 
-    // 2) Choose encoder + params; reuse param/output buffers to reduce allocations.
-    thread_local std::vector<int> params;
-    thread_local std::vector<uchar> encoded;
+    // Wrap input buffer without copying (OpenCV API is non-const, we never modify it).
+    const cv::Mat src(static_cast<int>(in.height), static_cast<int>(in.width), info->cv_type,
+                      const_cast<uint8_t *>(in.data.data()), static_cast<size_t>(in.step));
 
-    params.clear();
-    encoded.clear();
+    thread_local cv::Mat converted;
+    const cv::Mat *to_encode = &src;
+    if (info->to_bgr >= 0) {
+      cv::cvtColor(src, converted, info->to_bgr);
+      to_encode = &converted;
+    }
 
-    std::string fmt = format;
-    // normalize
-    if (fmt == "jpg") fmt = "jpeg";
-
+    std::vector<int> params;
     std::string ext;
     if (fmt == "png") {
       ext = ".png";
-      // PNG compression: 0 (fastest/biggest) .. 9 (slowest/smallest)
-      params.push_back(cv::IMWRITE_PNG_COMPRESSION);
-      params.push_back(std::max(0, std::min(9, png_level)));
-    } else if (fmt == "jpeg") {
+      params = {cv::IMWRITE_PNG_COMPRESSION, std::clamp(cfg.png_level, 0, 9)};
+    } else {
       ext = ".jpg";
-      // JPEG quality: 0..100
-      params.push_back(cv::IMWRITE_JPEG_QUALITY);
-      params.push_back(std::max(0, std::min(100, jpeg_quality)));
-    } else {
-      std::cout << "Unsupported compressed format: " << fmt << std::endl;
+      params = {cv::IMWRITE_JPEG_QUALITY, std::clamp(cfg.jpeg_quality, 0, 100)};
     }
 
-    // 3) Encode.
-    // JPEG cannot store alpha; if input is 4-channel and JPEG requested, convert to 3-channel.
-    // PNG supports 1/3/4 channels, so no conversion needed there.
-    if (fmt == "jpeg" && channels == 4) {
-      thread_local cv::Mat tmp3;
-      // Keep it fast: only convert when needed.
-      if (in->encoding == "rgba8") {
-        cv::cvtColor(src, tmp3, cv::COLOR_RGBA2BGR); // OpenCV default for JPEG is BGR ordering
-      } else {
-        // bgra8
-        cv::cvtColor(src, tmp3, cv::COLOR_BGRA2BGR);
-      }
-      if (!cv::imencode(ext, tmp3, encoded, params)) {
-        std::cout << "cv::imencode failed for JPEG." << std::endl;
-      }
-    } else {
-      if (!cv::imencode(ext, src, encoded, params)) {
-        std::cout << "cv::imencode failed." << std::endl;
-      }
-    }
-
-    // 4) Fill ROS CompressedImage
     sensor_msgs::msg::CompressedImage out;
-    out.header = in->header;
-    out.format = fmt; // commonly "png" or "jpeg"
-    out.data.assign(encoded.begin(), encoded.end());
+    out.header = in.header;
+    out.format = in.encoding + "; " + fmt + " compressed ";
+    if (info->color) out.format += "bgr" + std::to_string(info->bit_depth);
+
+    try {
+      // encode straight into the message buffer (same vector type => no extra copy)
+      if (!cv::imencode(ext, *to_encode, out.data, params)) return fail("cv::imencode returned false");
+    } catch (const cv::Exception &e) {
+      return fail(std::string("cv::imencode threw: ") + e.what());
+    }
     return out;
   }
 }

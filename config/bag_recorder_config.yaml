@@ -6,6 +6,8 @@ monitor:
   warn_grace_sec: 2.0
   use_ansi_color: true
 
+num_callback_groups: 1
+
 bags:
   - name: "main2"
     bag_uri: "/tmp/bag_test"
@@ -17,6 +19,7 @@ bags:
         type: "sensor_msgs/msg/Imu"
         qos: "default"
         mode: "generic"
+        callback_group_id: 0
         monitor:
           expected_hz: 100.0
           warn_below_hz: 95.0
@@ -24,6 +27,7 @@ bags:
         type: "sensor_msgs/msg/CompressedImage"
         qos: "default"
         mode: "generic"
+        callback_group_id: 0
         monitor:
           expected_hz: 10.0
           warn_below_hz: 9.0
@@ -31,6 +35,7 @@ bags:
         type: "sensor_msgs/msg/PointCloud2"
         qos: "default"
         mode: "generic"
+        callback_group_id: 0
         monitor:
           expected_hz: 10.0
           warn_below_hz: 9.0
