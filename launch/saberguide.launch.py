@@ -61,7 +61,7 @@ def call_zed_record_svo_service(svo_path):
     service_name = "/zed/zed_node/start_svo_rec"
     service_type = "zed_msgs/srv/StartSvoRec"
     # Format the request as a YAML-style string
-    service_request = f"'{{svo_filename: \"{svo_path}\"}}'"
+    service_request = f"'{{svo_filename: \"{svo_path}\", compression_mode: 2}}'"
 
     return ExecuteProcess(
         cmd=[
@@ -83,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
     container_name = LaunchConfiguration('container_name')
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    svo_filename = f"/home/haoming/zed_recording_{timestamp}.svo2"
+    svo_filename = f"/home/user/01_svo/arche2026_zed_{timestamp}.svo2"
 
     container_name_val = container_name.perform(context)
     if container_name_val == '':
@@ -117,18 +117,9 @@ def launch_setup(context, *args, **kwargs):
         target_container=full_container_name,
         composable_node_descriptions=[bag_recorder_component]
     )
+    
+
     return_array.append(load_composable_node)
-
-
-    # Delay the service call by 10 seconds to ensure ZED is fully booted
-    #return_array.append(
-    #    TimerAction(
-    #        period=2.0,
-    #        actions=[
-    #            call_zed_record_svo_service(svo_filename)
-    #        ]
-    #    )
-    #)
 
     return return_array
 

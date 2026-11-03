@@ -52,6 +52,10 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 
+// ti_mmwave_ros2_interfaces
+//#ifdef HAVE_TI_MMWARE_ROS2_INTERFACES
+#include <ti_mmwave_ros2_interfaces/msg/radar_scan.hpp>
+//#endif
 
 #ifdef HAVE_LIVOX_ROS_DRIVER2
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -271,6 +275,10 @@ namespace lsy_ros_data_utils::rosbag {
 #ifdef HAVE_RSLIDAR_MSG
     register_type<rslidar_msg::msg::RslidarPacket>("rslidar_msg/msg/RslidarPacket");
 #endif
+
+//#ifdef HAVE_TI_MMWARE_ROS2_INTERFACES
+    register_type<ti_mmwave_ros2_interfaces::msg::RadarScan>("ti_mmwave_ros2_interfaces/msg/RadarScan");
+//#endif
 
 
   }
