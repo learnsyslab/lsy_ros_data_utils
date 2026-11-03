@@ -83,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
     container_name = LaunchConfiguration('container_name')
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    svo_filename = f"/home/user/01_svo/zed_recording_{timestamp}.svo2"
+    svo_filename = f"/home/haoming/zed_recording_{timestamp}.svo2"
 
     container_name_val = container_name.perform(context)
     if container_name_val == '':
@@ -99,6 +99,7 @@ def launch_setup(context, *args, **kwargs):
             arguments=arguments_val,
             output='screen',
         )
+        container_name_val = 'bag_container'
         return_array.append(container)
 
     bag_recorder_component = ComposableNode(
@@ -120,14 +121,14 @@ def launch_setup(context, *args, **kwargs):
 
 
     # Delay the service call by 10 seconds to ensure ZED is fully booted
-    return_array.append(
-        TimerAction(
-            period=2.0,
-            actions=[
-                call_zed_record_svo_service(svo_filename)
-            ]
-        )
-    )
+    #return_array.append(
+    #    TimerAction(
+    #        period=2.0,
+    #        actions=[
+    #            call_zed_record_svo_service(svo_filename)
+    #        ]
+    #    )
+    #)
 
     return return_array
 
@@ -136,7 +137,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'container_name',
-            default_value='saberguide',
+            default_value='',
             description='The name of the container to be used to load the ZED component. If empty (default) a new container will be created.'),
         OpaqueFunction(function=launch_setup),
 
