@@ -60,6 +60,7 @@
 #ifdef HAVE_LIVOX_ROS_DRIVER2
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <livox_ros_driver2/msg/custom_point.hpp>
+#include <livox_ros_driver2/msg/time_sync_status.hpp>
 #endif
 
 #ifdef HAVE_SEPTENTRIO_GNSS_DRIVER
@@ -193,6 +194,7 @@ namespace lsy_ros_data_utils::rosbag {
 #ifdef HAVE_LIVOX_ROS_DRIVER2
     register_type<livox_ros_driver2::msg::CustomMsg>("livox_ros_driver2/msg/CustomMsg");
     register_type<livox_ros_driver2::msg::CustomPoint>("livox_ros_driver2/msg/CustomPoint");
+    register_type<livox_ros_driver2::msg::TimeSyncStatus>("livox_ros_driver2/msg/TimeSyncStatus");
 #endif
 
 #ifdef HAVE_SEPTENTRIO_GNSS_DRIVER

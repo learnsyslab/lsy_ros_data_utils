@@ -34,6 +34,9 @@
 #include <yaml-cpp/yaml.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -118,18 +121,32 @@ namespace lsy_ros_data_utils {
     if (!new_options.use_intra_process_comms()) {
       new_options.use_intra_process_comms(true);
     }
-    return options;
+    return new_options;
   }
 
-  inline rclcpp::QoS qos_from_string(const std::string &qos_name) {
-    if (qos_name == "sensor_data") {
-      return rclcpp::SensorDataQoS();
+  inline bool is_sensor_qos(const std::string &qos_name) {
+    // anything that is not explicitly "default" is treated as sensor data (best effort)
+    return qos_name != "default";
+  }
+
+  // Queue depth of a subscription. The stock SensorDataQoS depth of 5 is only 25 ms of
+  // headroom at 200 Hz: any short stall of the callback (e.g. a point cloud being
+  // serialized in the same callback group) silently drops messages. For a recorder we
+  // want about half a second of headroom instead.
+  inline size_t default_qos_depth(const double expected_hz) {
+    constexpr size_t kMinDepth = 10;
+    constexpr size_t kMaxDepth = 1000;
+    if (expected_hz <= 0.0) return kMinDepth;
+    const auto depth = static_cast<size_t>(std::ceil(expected_hz * 0.5));
+    return std::clamp(depth, kMinDepth, kMaxDepth);
+  }
+
+  inline rclcpp::QoS qos_from_string(const std::string &qos_name, const size_t depth = 10) {
+    if (is_sensor_qos(qos_name)) {
+      // best effort, volatile
+      return rclcpp::SensorDataQoS().keep_last(depth);
     }
-    if (qos_name == "default") {
-      return rclcpp::QoS(rclcpp::KeepLast(10));
-    }
-    // fallback
-    return rclcpp::SensorDataQoS();
+    return rclcpp::QoS(rclcpp::KeepLast(depth));
   };
 
   template<typename T, typename = void>

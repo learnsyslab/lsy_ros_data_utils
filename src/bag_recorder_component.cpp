@@ -28,6 +28,7 @@
 
 #include "bag_recorder_component.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -233,6 +234,7 @@ namespace lsy_ros_data_utils::rosbag {
         ts.name = require_string(t, "name");
         ts.type = require_string(t, "type");
         ts.qos = t["qos"] ? t["qos"].as<std::string>() : std::string("default");
+        if (t["qos_depth"]) ts.qos_depth = t["qos_depth"].as<size_t>();
         ts.mode = t["mode"] ? t["mode"].as<std::string>() : std::string("auto");
         if (t["monitor"]) {
           ts.monitor_enabled = true;
@@ -240,6 +242,7 @@ namespace lsy_ros_data_utils::rosbag {
           ts.expected_hz = mon["expected_hz"] ? mon["expected_hz"].as<double>() : 0.0;
           ts.warn_below_hz = mon["warn_below_hz"] ? mon["warn_below_hz"].as<double>() : 0.0;
         }
+        if (ts.qos_depth == 0) ts.qos_depth = default_qos_depth(ts.expected_hz);
         if (t["callback_group_id"] && t["callback_group_id"].as<size_t>() <= (cb_groups_.size() - 1)) {
           ts.cb_group = cb_groups_[t["callback_group_id"].as<size_t>()];
         } else {
@@ -254,13 +257,14 @@ namespace lsy_ros_data_utils::rosbag {
     // built_routing_tables
     topic_to_bags_.clear();
     topic_to_qos_.clear();
+    topic_to_qos_depth_.clear();
     topic_to_type_.clear();
     topic_to_mode_.clear();
     topic_stats_.clear();
 
     auto merged_qos = [](const std::string &a, const std::string &b) {
       // Policy: if ANY bag wants sensor_data => subscription uses sensor_data
-      if (a == "sensor_data" || b == "sensor_data") return std::string("sensor_data");
+      if (is_sensor_qos(a) || is_sensor_qos(b)) return std::string("sensor_data");
       return std::string("default");
     };
 
@@ -290,6 +294,10 @@ namespace lsy_ros_data_utils::rosbag {
         } else {
           qit->second = merged_qos(qit->second, ts.qos);
         }
+
+        // queue depth merge: the deepest request wins
+        auto &depth = topic_to_qos_depth_[ts.name];
+        depth = std::max(depth, ts.qos_depth);
 
         // mode merge (single subscription)
         if (auto mit = topic_to_mode_.find(ts.name); mit == topic_to_mode_.end()) {
@@ -620,7 +628,7 @@ namespace lsy_ros_data_utils::rosbag {
                      type.c_str(), topic.c_str());
         continue;
       }
-      const auto qos = qos_from_string(topic_to_qos_.at(topic));
+      const auto qos = qos_from_string(topic_to_qos_.at(topic), topic_to_qos_depth_.at(topic));
       const auto mode = topic_to_mode_.contains(topic) ? topic_to_mode_.at(topic) : std::string("auto");
 
       const bool typed_available = (type_registry_.contains(type));
@@ -655,8 +663,10 @@ namespace lsy_ros_data_utils::rosbag {
           const int64_t recv_ns = this->now().nanoseconds();
           const int64_t send_ns = recv_ns; // can't extract header stamp without deserializing
 
-          const auto &rin = msg->get_rcl_serialized_message();
-          auto payload = BagRecorderComponent::make_rcutils_uint8_array_copy(rin);
+          // No copy: alias the buffer of the received message and keep the message alive
+          // for as long as the bag item lives (rclcpp hands us a fresh message each time).
+          auto payload = std::shared_ptr<rcutils_uint8_array_t>(
+            msg, &msg->get_rcl_serialized_message());
 
           // Use the new helper!
           this->build_and_enqueue_msg(topic, send_ns, recv_ns, std::move(payload));

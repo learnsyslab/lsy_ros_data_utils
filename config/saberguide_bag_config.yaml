@@ -6,15 +6,15 @@ monitor:
   warn_grace_sec: 2.0
   use_ansi_color: true
 
-num_callback_groups: 3
+num_callback_groups: 4
 
 bags:
-  - name: "arche2026"
+  - name: "lsy_outdoor"
     bag_uri: "/home/user/00_bags"
     storage_id: "mcap"
     storage_config_file: "mcap_config.yaml"
     uri_with_datetime: true
-    max_queue_bytes: 4073741824     # 1GiB MiB
+    max_queue_bytes: 4073741824     # bytes (3.8 GiB)
     max_queue_size: 5000          # secondary cap
     bag_cache_size: 4             # GB
     overflow_policy: block  # or "block" drop_oldest
@@ -180,6 +180,14 @@ bags:
         monitor:
           expected_hz: 200.0
           warn_below_hz: 180.0
+        callback_group_id: 3
+      - name: "/livox/time_sync_status"
+        type: "livox_ros_driver2/msg/TimeSyncStatus"
+        qos: "default"
+        mode: "typed"
+        monitor:
+          expected_hz: 1.0
+          warn_below_hz: 0.5
         callback_group_id: 1
 
       - name: "/rslidar/points"
@@ -197,7 +205,7 @@ bags:
         monitor:
           expected_hz: 200.0
           warn_below_hz: 100.0
-        callback_group_id: 1
+        callback_group_id: 3
 
       ## septentrio
       - name: "/septentrio/attcoveuler"
@@ -447,7 +455,7 @@ bags:
         monitor:
           expected_hz: 200.0
           warn_below_hz: 100.0
-        callback_group_id: 1
+        callback_group_id: 3
       - name: "/zed/zed_node/imu/data_raw"
         type: "sensor_msgs/msg/Imu"
         qos: "sensor"
@@ -455,7 +463,7 @@ bags:
         monitor:
           expected_hz: 200.0
           warn_below_hz: 100.0
-        callback_group_id: 1
+        callback_group_id: 3
       - name: "/ti_mmwave/radar_scan"
         type: "ti_mmwave_ros2_interfaces/msg/RadarScan"
         qos: "sensor"

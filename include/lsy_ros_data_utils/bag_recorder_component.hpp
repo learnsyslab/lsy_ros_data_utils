@@ -64,7 +64,8 @@ namespace lsy_ros_data_utils::rosbag {
   struct TopicSpec {
     std::string name;
     std::string type;
-    std::string qos; // "sensor_data" or "default"
+    std::string qos; // "sensor" (best effort) or "default" (reliable)
+    size_t qos_depth{0}; // subscription queue depth, 0 => derived from expected_hz
     std::string mode; // "auto" or "typed" for intra communication process or "generic" with serialization
     rclcpp::CallbackGroup::SharedPtr cb_group;
     bool monitor_enabled{false};
@@ -207,6 +208,7 @@ namespace lsy_ros_data_utils::rosbag {
     // For creating exactly one subscription per topic
     std::unordered_map<std::string, std::string> topic_to_type_;
     std::unordered_map<std::string, std::string> topic_to_qos_; // merged qos policy
+    std::unordered_map<std::string, size_t> topic_to_qos_depth_; // merged (largest) queue depth
     std::unordered_map<std::string, std::string> topic_to_mode_; // per unique topic
     std::unordered_map<std::string, rclcpp::CallbackGroup::SharedPtr> topic_to_callback_groups_;
 
