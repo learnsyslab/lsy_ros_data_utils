@@ -107,6 +107,20 @@ namespace lsy_ros_data_utils::rosbag {
     // one subscription per unique topic, created from type string via registry
     this->create_subscriptions();
 
+    // Dedicated executor for the subscription callback groups, one thread per
+    // (mutually exclusive) group.
+    {
+      rclcpp::ExecutorOptions exec_options;
+      exec_options.context = this->get_node_base_interface()->get_context();
+      sub_executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>(
+        exec_options, std::max<size_t>(cb_groups_.size(), 1));
+      for (const auto &group: cb_groups_) {
+        sub_executor_->add_callback_group(group, this->get_node_base_interface());
+      }
+      auto *executor = sub_executor_.get();
+      sub_executor_thread_ = std::thread([executor]() { executor->spin(); });
+    }
+
     // writer thread per bag
     for (auto &br: bags_) {
       auto *raw = br.get();
@@ -128,12 +142,23 @@ namespace lsy_ros_data_utils::rosbag {
   BagRecorderComponent::~BagRecorderComponent() {
     is_shutting_down_.store(true);
 
+    // Stop our private executor first, so no subscription callback is running
+    // or can start while the rest of the node is torn down.
+    if (sub_executor_) {
+      // cancel() is a no-op until spin() has started.
+      while (sub_executor_thread_.joinable() && rclcpp::ok() && !sub_executor_->is_spinning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      sub_executor_->cancel();
+      if (sub_executor_thread_.joinable()) {
+        sub_executor_thread_.join();
+      }
+    }
+
     subs_.clear();
 
-    // 3. Wait for all currently executing ghost callbacks to physically exit
-    // while (active_callbacks_.load() > 0) {
-    //   std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    // }
+    // The executor must release the callback groups before the node destroys them.
+    sub_executor_.reset();
 
     for (const auto &br: bags_) {
       br->stop.store(true);
@@ -146,9 +171,6 @@ namespace lsy_ros_data_utils::rosbag {
       }
     }
 
-
-    RCLCPP_INFO(get_logger(), "BagRecorderComponent destroying, waiting for 5 seconds.");
-    std::this_thread::sleep_for(std::chrono::seconds(5));
     RCLCPP_INFO(get_logger(), "BagRecorderComponent destroyed.");
   }
 
@@ -163,8 +185,14 @@ namespace lsy_ros_data_utils::rosbag {
     if (config["num_callback_groups"]) {
       const auto num_callback_groups = config["num_callback_groups"].as<size_t>();
       for (size_t i = 0; i < num_callback_groups; ++i) {
+        // Not added to the container's executor: these groups are spun by
+        // sub_executor_. On Humble, unloading a component whose node has more
+        // than one callback group in the container's executor leaves stale
+        // guard conditions behind (Executor::remove_node only drops the one of
+        // the last group) and the container aborts with "guard condition
+        // implementation is invalid" on its next wait.
         cb_groups_.push_back(
-          this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive));
+          this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false));
       }
     } else {
       throw std::runtime_error("Parameter 'num_callback_groups' required!");

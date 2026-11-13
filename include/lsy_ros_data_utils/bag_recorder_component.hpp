@@ -214,6 +214,10 @@ namespace lsy_ros_data_utils::rosbag {
 
     std::vector<rclcpp::CallbackGroup::SharedPtr> cb_groups_;
     size_t next_cb_group_idx_{0};
+    // Spins cb_groups_ on its own threads; see load_config() for why they are
+    // kept out of the container's executor.
+    std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> sub_executor_;
+    std::thread sub_executor_thread_;
 
     // registry: "sensor_msgs/msg/Image" -> factory that creates typed sub
     using SubFactory = std::function<rclcpp::SubscriptionBase::SharedPtr(
