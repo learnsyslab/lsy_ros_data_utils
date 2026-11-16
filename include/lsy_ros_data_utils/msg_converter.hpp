@@ -53,12 +53,18 @@ namespace lsy_ros_data_utils {
       channels = 3;
       return;
     }
-    if (enc == "mono8") {
+    if (enc == "mono8" || enc == "8UC1") {
       cv_type = CV_8UC1;
       channels = 1;
       return;
     }
-    throw std::runtime_error("Unsupported encoding: " + enc);
+    if (enc == "mono16" || enc == "16UC1") {
+      // 16 bit, PNG only
+      cv_type = CV_16UC1;
+      channels = 1;
+      return;
+    }
+    throw std::runtime_error("unsupported encoding '" + enc + "'");
   }
 
   // Efficient conversion: raw Image -> CompressedImage.
@@ -75,8 +81,9 @@ namespace lsy_ros_data_utils {
     int cv_type = 0, channels = 0;
     encoding_to_cv_type(in->encoding, cv_type, channels);
 
-    if (in->step == 0 || in->data.empty()) {
-      std::cout << "Input image has empty data/step." << std::endl;
+    if (in->step == 0 || in->data.empty() || in->height == 0 || in->width == 0 ||
+        in->data.size() < static_cast<size_t>(in->step) * in->height) {
+      throw std::runtime_error("image has empty or inconsistent data/step");
     }
 
     // rows = height, cols = width; step is bytes per row.
@@ -109,28 +116,36 @@ namespace lsy_ros_data_utils {
       params.push_back(cv::IMWRITE_JPEG_QUALITY);
       params.push_back(std::max(0, std::min(100, jpeg_quality)));
     } else {
-      std::cout << "Unsupported compressed format: " << fmt << std::endl;
+      throw std::runtime_error("unsupported compression_type '" + format + "' (use png or jpeg)");
+    }
+    if (fmt == "jpeg" && cv_type == CV_16UC1) {
+      throw std::runtime_error("JPEG cannot store 16 bit images, use png");
     }
 
     // 3) Encode.
-    // JPEG cannot store alpha; if input is 4-channel and JPEG requested, convert to 3-channel.
-    // PNG supports 1/3/4 channels, so no conversion needed there.
-    if (fmt == "jpeg" && channels == 4) {
-      thread_local cv::Mat tmp3;
-      // Keep it fast: only convert when needed.
-      if (in->encoding == "rgba8") {
-        cv::cvtColor(src, tmp3, cv::COLOR_RGBA2BGR); // OpenCV default for JPEG is BGR ordering
-      } else {
-        // bgra8
-        cv::cvtColor(src, tmp3, cv::COLOR_BGRA2BGR);
-      }
-      if (!cv::imencode(ext, tmp3, encoded, params)) {
-        std::cout << "cv::imencode failed for JPEG." << std::endl;
-      }
+    // cv::imencode expects BGR(A) channel order, so RGB(A) input has to be swapped,
+    // otherwise red and blue are exchanged in the stored file.
+    // JPEG cannot store alpha: 4-channel input is reduced to 3 channels for it.
+    // PNG supports 1/3/4 channels.
+    int conversion = -1;
+    if (in->encoding == "rgb8") {
+      conversion = cv::COLOR_RGB2BGR;
+    } else if (in->encoding == "rgba8") {
+      conversion = (fmt == "jpeg") ? cv::COLOR_RGBA2BGR : cv::COLOR_RGBA2BGRA;
+    } else if (in->encoding == "bgra8" && fmt == "jpeg") {
+      conversion = cv::COLOR_BGRA2BGR;
+    }
+
+    bool ok = false;
+    if (conversion >= 0) {
+      thread_local cv::Mat converted;
+      cv::cvtColor(src, converted, conversion);
+      ok = cv::imencode(ext, converted, encoded, params);
     } else {
-      if (!cv::imencode(ext, src, encoded, params)) {
-        std::cout << "cv::imencode failed." << std::endl;
-      }
+      ok = cv::imencode(ext, src, encoded, params);
+    }
+    if (!ok) {
+      throw std::runtime_error("cv::imencode failed");
     }
 
     // 4) Fill ROS CompressedImage

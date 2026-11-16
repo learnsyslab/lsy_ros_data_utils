@@ -96,8 +96,8 @@ namespace lsy_ros_data_utils::rosbag {
     if (cfg_file_.empty()) {
       throw std::runtime_error("Parameter 'config_file' is required.");
     }
-    this->init_type_registry();
     this->load_config(cfg_file_);
+    this->init_type_registry();
 
     // open bags + create topics
     for (auto &br: bags_) {
@@ -247,11 +247,15 @@ namespace lsy_ros_data_utils::rosbag {
                                       ? package_path + bag["storage_config_file"].as<std::string>()
                                       : std::string("");
 
-      compress_images_ = bag["compress_image"] ? bag["compress_image"].as<bool>() : false;
+      br->spec.compress_image = bag["compress_image"] ? bag["compress_image"].as<bool>() : false;
 
-      jpeg_quality_ = bag["jpeg_quality"] ? bag["jpeg_quality"].as<int>() : 95;
-      png_level_ = bag["png_level"] ? bag["png_level"].as<int>() : 3;
-      compression_type_ = bag["compression_type"] ? bag["compression_type"].as<std::string>() : std::string("png");
+      // One encoder configuration for the whole recorder: taken from the bags
+      // that actually compress (the last one wins if they differ).
+      if (br->spec.compress_image) {
+        jpeg_quality_ = bag["jpeg_quality"] ? bag["jpeg_quality"].as<int>() : 95;
+        png_level_ = bag["png_level"] ? bag["png_level"].as<int>() : 3;
+        compression_type_ = bag["compression_type"] ? bag["compression_type"].as<std::string>() : std::string("png");
+      }
 
       if (!bag["topics"] || !bag["topics"].IsSequence()) {
         throw std::runtime_error("Each bag must contain 'topics' as a sequence.");
@@ -306,7 +310,10 @@ namespace lsy_ros_data_utils::rosbag {
 
     for (size_t i = 0; i < bags_.size(); i++) {
       for (const auto &bag = bags_[i]->spec; const auto &ts: bag.topics) {
-        topic_to_bags_[ts.name].push_back(i);
+        // Keyed by the name the messages are written under: images of a
+        // compressing bag go to "<topic>/compressed".
+        const bool compressed = bag.compress_image && ts.type == kImageType;
+        topic_to_bags_[compressed ? ts.name + kCompressedSuffix : ts.name].push_back(i);
 
         // type consistency
         if (auto it = topic_to_type_.find(ts.name); it == topic_to_type_.end()) {
@@ -399,11 +406,12 @@ namespace lsy_ros_data_utils::rosbag {
     // crate only this bag's topics
     for (const auto &ts: br.spec.topics) {
       rosbag2_storage::TopicMetadata md;
-      md.name = ts.name;
-      if (ts.type == "sensor_msgs/msg/Image" && compress_images_) {
-        // override the message type if we want to compresse the images
-        md.type = "sensor_msgs/msg/CompressedImage";
+      if (ts.type == kImageType && br.spec.compress_image) {
+        // compressed images are stored under their own name and type
+        md.name = ts.name + kCompressedSuffix;
+        md.type = kCompressedImageType;
       } else {
+        md.name = ts.name;
         md.type = ts.type;
       }
       md.serialization_format = "cdr";
@@ -650,18 +658,28 @@ namespace lsy_ros_data_utils::rosbag {
     subs_.reserve(topic_to_type_.size());
 
     for (const auto &[topic, type]: topic_to_type_) {
-      if (auto it = type_registry_.find(type); it == type_registry_.end()) {
-        RCLCPP_ERROR(get_logger(),
-                     "Type not registered (cannot create typed intra-process subscription): type='%s' topic='%s'",
-                     type.c_str(), topic.c_str());
-        continue;
-      }
       const auto qos = qos_from_string(topic_to_qos_.at(topic), topic_to_qos_depth_.at(topic));
       const auto mode = topic_to_mode_.contains(topic) ? topic_to_mode_.at(topic) : std::string("auto");
 
-      const bool typed_available = (type_registry_.contains(type));
-      const bool want_typed = (mode == "typed") || (mode == "auto" && typed_available);
-      const bool want_generic = (mode == "generic") || (mode == "auto" && !typed_available);
+      // Typed subscriptions exist only for registered types; every type can be
+      // recorded through a generic subscription.
+      const bool typed_available = type_registry_.contains(type);
+      // Compression works on the in-memory image, so it needs the typed path.
+      const bool needs_typed = topic_to_bags_.contains(topic + kCompressedSuffix);
+
+      if (mode == "typed" && !typed_available) {
+        RCLCPP_WARN(get_logger(),
+                    "No typed support compiled in for type='%s' (topic='%s'): recording it with a generic subscription.",
+                    type.c_str(), topic.c_str());
+      }
+      if (mode == "generic" && needs_typed && typed_available) {
+        RCLCPP_WARN(get_logger(),
+                    "Topic '%s' is compressed in at least one bag: using a typed subscription instead of mode 'generic'.",
+                    topic.c_str());
+      }
+
+      const bool want_typed = typed_available && (mode != "generic" || needs_typed);
+      const bool want_generic = !want_typed;
 
       if (want_typed) {
         // if typed, we assume that the message was passed through the intra comm process
@@ -703,20 +721,63 @@ namespace lsy_ros_data_utils::rosbag {
         auto subscription_options = rclcpp::SubscriptionOptions();
         subscription_options.callback_group = topic_to_callback_groups_.at(topic);
 
-        auto sub = this->create_generic_subscription(
-          topic,
-          type,
-          qos,
-          std::move(cb),
-          subscription_options);
-
-        subs_.push_back(sub);
-        continue;
+        try {
+          auto sub = this->create_generic_subscription(
+            topic,
+            type,
+            qos,
+            std::move(cb),
+            subscription_options);
+          subs_.push_back(sub);
+        } catch (const std::exception &e) {
+          // e.g. the message package of this type is not installed / not sourced
+          RCLCPP_ERROR(get_logger(), "Topic '%s' is NOT recorded: cannot subscribe to type='%s': %s",
+                       topic.c_str(), type.c_str(), e.what());
+        }
       }
-
-      // Should never reach here
-      RCLCPP_ERROR(get_logger(), "Failed to create subscription for topic='%s' type='%s'", topic.c_str(), type.c_str());
     }
+  }
+
+  void BagRecorderComponent::init_type_registry() {
+    type_registry_.clear();
+    this->register_common_types();
+    this->register_device_types();
+    this->register_septentrio_types_a();
+    this->register_septentrio_types_b();
+  }
+
+  std::shared_ptr<rcutils_uint8_array_t>
+  BagRecorderComponent::take_payload(rclcpp::SerializedMessage &serialized) {
+    return {
+      new rcutils_uint8_array_t(serialized.release_rcl_serialized_message()),
+      [](rcutils_uint8_array_t *arr) {
+        if (arr) {
+          rcutils_uint8_array_fini(arr);
+          delete arr;
+        }
+      }
+    };
+  }
+
+  void BagRecorderComponent::enqueue_compressed_image(
+    const std::string &bag_topic_name,
+    const sensor_msgs::msg::Image::ConstSharedPtr &msg,
+    const int64_t send_ns,
+    const int64_t recv_ns) {
+    rclcpp::SerializedMessage serialized_msg;
+    try {
+      const auto compressed_img = toCompressed(msg, compression_type_, jpeg_quality_, png_level_);
+      const rclcpp::Serialization<sensor_msgs::msg::CompressedImage> ser;
+      ser.serialize_message(&compressed_img, &serialized_msg);
+    } catch (const std::exception &e) {
+      // A CompressedImage topic cannot carry the raw image instead, so the frame is lost.
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "Dropping image for '%s' (encoding '%s'): compression failed: %s. "
+                            "Record this topic in a bag without compress_image.",
+                            bag_topic_name.c_str(), msg->encoding.c_str(), e.what());
+      return;
+    }
+    this->build_and_enqueue_msg(bag_topic_name, send_ns, recv_ns, take_payload(serialized_msg));
   }
 
   void BagRecorderComponent::build_and_enqueue_msg(const std::string &topic_name, int64_t send_ns, int64_t recv_ns,
@@ -776,7 +837,6 @@ namespace lsy_ros_data_utils::rosbag {
 
   void BagRecorderComponent::monitor_timer_cb() {
     if (!monitor_cfg_.enabled) return;
-    static bool first_run = true;
 
     // Clear terminal + move cursor to top-left
     std::cout << "\033[2J\033[H" << std::flush;
@@ -790,25 +850,26 @@ namespace lsy_ros_data_utils::rosbag {
     RCLCPP_INFO(get_logger(), "%-40s  %8s  %8s  %8s  %s",
                 "topic", "ewmaHz", "warn<", "count", "rate");
 
-    static std::vector<std::pair<std::string, TopicStats *> > topic_stats_container;
-
-    if (first_run) {
-      topic_stats_container.reserve(topic_stats_.size());
+    // Built per instance, not as a function-level static: the container process
+    // outlives this component, and a static list would keep pointing at the
+    // TopicStats of an already unloaded recorder after a reload.
+    // topic_stats_ is not modified after load_config(), so the pointers stay valid.
+    if (monitor_topics_sorted_.empty() && !topic_stats_.empty()) {
+      monitor_topics_sorted_.reserve(topic_stats_.size());
 
       for (auto &kv: topic_stats_) {
-        topic_stats_container.emplace_back(kv.first, &kv.second);
+        monitor_topics_sorted_.emplace_back(&kv.first, &kv.second);
       }
 
       // Sort by topic name
-      std::sort(topic_stats_container.begin(), topic_stats_container.end(),
+      std::sort(monitor_topics_sorted_.begin(), monitor_topics_sorted_.end(),
                 [](const auto &a, const auto &b) {
-                  return a.first < b.first;
+                  return *a.first < *b.first;
                 });
-      first_run = false;
     }
 
-    for (auto &kv: topic_stats_container) {
-      const std::string &topic = kv.first;
+    for (auto &kv: monitor_topics_sorted_) {
+      const std::string &topic = *kv.first;
       TopicStats &st = *kv.second;
       if (!st.enabled) continue;
 

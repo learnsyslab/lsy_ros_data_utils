@@ -70,7 +70,11 @@ set(AMENT_DEPENDENCIES_GENERAL
 
 add_library(bag_recorder_component SHARED
         src/bag_recorder_component.cpp
-        src/bag_recorder_type_registration.cpp
+        # typed-subscription registrations, split so they compile in parallel
+        src/bag_recorder_types_common.cpp
+        src/bag_recorder_types_devices.cpp
+        src/bag_recorder_types_septentrio_a.cpp
+        src/bag_recorder_types_septentrio_b.cpp
         include/lsy_ros_data_utils/msg_converter.hpp
 )
 target_link_libraries(bag_recorder_component
